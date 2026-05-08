@@ -921,3 +921,146 @@ The same scripts work on CUDA without modification. Skip the AITER install on CU
 - Module README: `vllm/v1/attention/triattention/README.md`
 - Unit tests: `tests/v1/attention/test_triattention_v3.py`
 - TQ+ AMD-specific roadmap: see the V3-port-context paper at `vLLM AMD TurboQuant+ Improvements Roadmap`
+
+---
+
+## 10. Addendum: Swift Port + longctx Rescue — Fixing the Hybrid NIAH Failure
+
+This addendum reports the Apple Silicon Swift port of V3 and validates the rescue path that resolves the hybrid Mamba+Attention NIAH failure documented in Section 7.1.
+
+### 10.1 The fix in one sentence
+
+V3 alone is fundamentally one-way — eviction throws cells away. On hybrid models (Qwen3.5 family, partial RoPE, M-RoPE) V3 evicts the wrong cells often enough that planted-fact NIAH fails at every context rung tested. **The fix is not a V3 algorithm change. It is the addition of a rescue layer (longctx-svc) that captures evicted spans and restores them to the prompt before the next prefill.** Section 7.1 hypothesizes a scoring change might rescue V3 on hybrids; the receipts below show that with longctx the scoring change is unnecessary at the model sizes and contexts tested.
+
+### 10.2 Setup
+
+- 1× Apple M5 Max, 128 GB unified memory, macOS 26.4
+- Engine: `TheTom/mlx-swift-lm` at `feature/triattention-v3` (Swift port of V3)
+- Model: `mlx-community/Qwen3.5-2B-4bit` (hybrid Mamba+Attention, the same family Section 7.1 flags as broken under V3)
+- Companion service: `longctx-svc` v0.3.0a3 on `127.0.0.1:5054`
+- Driver: `ChatSession` (auto Tier-3 rehydrate hook fires at turn boundary)
+- Test harness: `Tests/Benchmarks/V3ChatSessionRamp.swift`
+
+V3 config: default 10% rate (`budget = ctx × 0.9`, window=128, prefix=32, warmup=256, hybrid=2). Same parameter shape as the AMD/Python path documented in Section 6.
+
+### 10.3 Three arms × four context rungs
+
+```
+ctx     arm           t1       t2     v3%    rounds  recall  total
+32K     baseline-tq8v4  5.6s   0.0s   0.00%  0       ✓HIT     5.6s
+32K     v3-only         6.8s   0.2s   3.72%  12      ✗miss    6.9s
+32K     v3+longctx      7.7s   0.6s   3.72%  12      ✓HIT     8.3s
+64K     baseline-tq8v4 16.7s   0.0s   0.00%  0       ✓HIT    16.7s
+64K     v3-only        19.5s   0.2s   2.17%  18      ✗miss   19.7s
+64K     v3+longctx     20.9s   0.9s   2.17%  18      ✓HIT    21.8s
+128K    baseline-tq8v4 76.3s   0.0s   0.00%  0       ✓HIT    76.3s
+128K    v3-only        66.9s   0.8s   1.42%  24      ✗miss   67.6s
+128K    v3+longctx     69.5s   1.3s   1.42%  24      ✓HIT    70.9s
+256K    baseline-tq8v4 186.7s  0.0s   0.00%  0       ✓HIT   186.7s
+256K    v3-only        220.9s  1.0s   1.32%  30      ✗miss  221.9s
+256K    v3+longctx     226.9s  2.4s   1.32%  30      ✓HIT   229.3s
+```
+
+V3 alone ✗miss every rung. V3+longctx ✓HIT every rung. Baseline turbo8v4 (no eviction) ✓HIT every rung. The pattern Section 7.1 documented on AMD reproduces cleanly on the Swift port. The rescue layer flips it.
+
+### 10.4 Why the V3-only column is misleadingly fast
+
+At 128K and 256K, the V3-only arm prefill (66.9s and 220.9s) is faster than the baseline turbo8v4 arm (76.3s and 186.7s) at 128K but slower at 256K. The 128K speedup is real — V3 evicts cells, shrinking the effective KV during decode — but the receipt that matters is recall: ✗miss across the board. A faster arm that doesn't recover the planted fact is broken, not improved. The V3+longctx arm pays a ~22% prefill overhead at 256K (229s vs 187s) to add the rescue layer, and recovers recall.
+
+### 10.5 Architecture of the fix (turn-by-turn)
+
+```
+   USER TURN N  (long blob: filler + planted fact)
+   │
+   ▼
+   ChatSession.respond(prompt)
+   │
+   ▼
+   Build messages list, run prefill
+   │
+   ▼
+   Model forward, layer-by-layer:
+   ┌─────────────────────────────────────────────────────────┐
+   │ for each layer:                                         │
+   │     attention(Q, K, V)  →  cache.update(K, V)           │
+   │     V3.accumulateLayerScore(K, layerIdx)                │
+   │ when cumulative cells > budget + divideLength:          │
+   │     evict_pos = V3.finalizeEvictRound()                 │
+   │     for c in cache:                                     │
+   │         c.removePositions(evict_pos)                    │
+   │     ┌─────────────────────────────────────────────┐     │
+   │     │  TriAttentionRescue.shared.onEvict(spans)   │     │
+   │     │   ├─ tokenizer.decode(evicted_ids)          │     │
+   │     │   └─ POST /evict/write?session_id=...       │ ────┼──▶ longctx-svc
+   │     └─────────────────────────────────────────────┘     │      ingests, embeds,
+   └─────────────────────────────────────────────────────────┘      indexes in faiss
+                          │
+                          ▼
+                  Generate "OK" ack (turn N output)
+
+
+   USER TURN N+1  (the question — "What's the access code?")
+   │
+   ▼
+   ChatSession.respond(question)
+   │
+   ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │  TIER-3 AUTO-REHYDRATE (only fires through ChatSession) │
+   │  if any cache is TriAttentionKVCache:                   │
+   │      recovered = rescue.rehydratePrompt(query=question) │ ────▶ POST /evict/retrieve
+   │      if recovered:                                      │      ◀── top-K chunks
+   │          messages.insert(.system(recovered),            │
+   │                          before user_msg)               │
+   └─────────────────────────────────────────────────────────┘
+   │
+   ▼
+   Prefill turn N+1 (now sees recovered chunks containing planted fact)
+   │
+   ▼
+   Generate answer  ─────▶  "481729"  ✓HIT
+```
+
+### 10.6 The driver gotcha (and why this is documented as a fix)
+
+The auto-Tier-3 rehydrate hook is only wired on `ChatSession` (commit `fe1a3b0` in `mlx-swift-lm`). Drivers that call `container.generate()` directly **will not rescue evicted facts** — they get the V3-only behavior column above. This is the most common bug we hit during the port: V3 evicts correctly, longctx-svc ingests correctly, but the model never sees the recovered chunks because the driver bypassed `ChatSession`.
+
+A separate single-cell test at 256K with `container.generate()` (instead of `ChatSession`) confirmed:
+
+```
+prompt_tok=247753, budget=230400
+prefill=224.55s, decode=6.22s, tps=10.1
+v3_rounds=30, v3%=1.32%
+longctx_session_total=19427    ← chunks ingested into longctx-svc
+recall=✗miss                   ← bare driver doesn't fire rehydrate
+```
+
+The write path is firing (19,427 chunks captured during prefill). The read path is not, because the driver isn't on the rehydrate-aware code path. Custom drivers must call `TriAttentionRescue.shared.rehydratePrompt(query:)` manually before each prefill, or run on `ChatSession`.
+
+The fix lands in the documentation (the new section in `mlx-swift-lm`'s README under "TriAttention V3 + longctx (long-context rescue)" recommends *not* enabling V3 without longctx) and in the production defaults in Section 6 of `longctx-1m-and-triattention.md`.
+
+### 10.7 What this resolves from Section 7.1
+
+Section 7.1 asked **"why does V3 break on hybrid Mamba+Attention models?"** and listed three viable hypotheses (partial-RoPE blindness, phase-only scoring, M-RoPE theta scaling) plus a request for community recipes that work.
+
+This addendum doesn't answer the underlying scoring question. The hypotheses in 7.1 may all still be correct. What it shows is: at the model sizes (2B-4bit Qwen3.5) and contexts (32K-256K) tested on Apple Silicon, the V3 + longctx rescue stack works without any algorithmic change to V3. The rescue layer compensates for whatever cells V3 evicts incorrectly.
+
+This is operationally useful: production workloads on hybrid models can ship V3 by enabling longctx alongside it. The scoring research from Section 7.1 remains relevant — a V3 that doesn't evict the planted fact in the first place would skip the rescue round-trip and reduce latency — but the rescue stack is shippable.
+
+### 10.8 What is not yet measured
+
+- **No data above 256K.** The Swift port test ran 32K → 256K. 1M context is not yet tested on Apple Silicon under V3+longctx. The MRCR v2 1M results in `longctx-1m-and-triattention.md` are on AMD MI300X without V3 (longctx as standalone retrieval).
+- **No test on Qwen3.5-27B / Qwen3.5-35B-A3B.** Section 7.1's failure was reported on these larger hybrids. The Apple Silicon test ran on 2B because it fits in M5 Max memory comfortably alongside longctx-svc. The expectation is the same V3+longctx pattern will work on the larger hybrids — verification pending hardware availability.
+- **V3 + TQ+ stacking still gated.** `TriAttentionKVCache` extends `KVCacheSimple` (FP16-only). Stacking V3 with TurboQuant codecs requires a `TriAttentionTurboKVCache` variant. Tracked but not yet shipped.
+
+### 10.9 Cross-reference
+
+Full architectural diagrams, the longctx side of the rescue path, and the MRCR v2 1M numbers are in the companion paper `longctx-1m-and-triattention.md`. The Swift port code lives at:
+
+- `mlx-swift-lm/Libraries/MLXLMCommon/TriAttention/` — Engine, cache, rescue bridge
+- `mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4.swift` (and family parallels) — V3 hook in `newCache`
+- `mlx-swift-lm/Tests/Benchmarks/V3ChatSessionRamp.swift` — the harness that produced Section 10.3
+
+```bash
+RUN_V3_CHAT_RAMP=1 swift test --filter "V3ChatSessionRamp"
+```
